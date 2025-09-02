@@ -1,0 +1,125 @@
+import os
+from fastapi import FastAPI, UploadFile, File, Form
+from backend.database import get_connection
+from fastapi import FastAPI, UploadFile, File, Form, Query
+
+
+app = FastAPI()
+
+# Dossier local pour sauvegarder les fichiers
+UPLOAD_FOLDER = "backend/uploads"
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), created_by: str = Form(...)):
+    try:
+        # 1. Sauvegarde du fichier sur disque
+        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        # 2. Enregistrement dans Oracle
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO ged_documents (original_name, storage_path, content_type, size_bytes, created_by)
+            VALUES (:1, :2, :3, :4, :5)
+        """, (
+            file.filename,
+            file_path,
+            file.content_type,
+            os.path.getsize(file_path),
+            created_by
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"status": "success", "filename": file.filename, "path": file_path}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+
+##############################################""""
+@app.get("/search")
+async def search_documents(
+    keyword: str = Query(None, description="Mot-clé à chercher dans le nom ou le contenu"),
+    created_by: str = Query(None, description="Filtrer par créateur")
+):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Construire la requête SQL dynamiquement
+        sql = "SELECT doc_id, original_name, created_by, created_at FROM ged_documents WHERE 1=1"
+        params = {}
+
+        if keyword:
+            sql += " AND (LOWER(original_name) LIKE :keyword OR LOWER(full_text) LIKE :keyword)"
+            params["keyword"] = f"%{keyword.lower()}%"
+
+        if created_by:
+            sql += " AND created_by = :created_by"
+            params["created_by"] = created_by
+
+        cur.execute(sql, params)
+
+        results = []
+        for row in cur:
+            results.append({
+                "doc_id": row[0],
+                "original_name": row[1],
+                "created_by": row[2],
+                "created_at": str(row[3])
+            })
+
+        cur.close()
+        conn.close()
+
+        return {"status": "success", "results": results}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+    
+#download
+################################################################
+from fastapi.responses import FileResponse
+
+@app.get("/download/{doc_id}")
+async def download_document(doc_id: int):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Récupérer le chemin du fichier
+        cur.execute("""
+            SELECT original_name, storage_path 
+            FROM ged_documents 
+            WHERE doc_id = :id
+        """, {"id": doc_id})
+        
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return {"status": "error", "message": "Document introuvable"}
+
+        filename, filepath = row
+
+        # Vérifier si le fichier existe sur le disque
+        if not os.path.exists(filepath):
+            return {"status": "error", "message": "Fichier manquant sur le serveur"}
+
+        # Retourner le fichier
+        return FileResponse(
+            path=filepath,
+            filename=filename,
+            media_type="application/octet-stream"
+        )
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
